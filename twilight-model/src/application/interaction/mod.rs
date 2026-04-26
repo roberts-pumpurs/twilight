@@ -419,8 +419,8 @@ impl<'de> Visitor<'de> for InteractionVisitor {
 
         let application_id =
             application_id.ok_or_else(|| DeError::missing_field("application_id"))?;
-        let attachment_size_limit = attachment_size_limit
-            .ok_or_else(|| DeError::missing_field("attachment_size_limit"))?;
+        let attachment_size_limit =
+            attachment_size_limit.ok_or_else(|| DeError::missing_field("attachment_size_limit"))?;
         let authorizing_integration_owners = authorizing_integration_owners
             .ok_or_else(|| DeError::missing_field("authorizing_integration_owners"))?;
         let id = id.ok_or_else(|| DeError::missing_field("id"))?;
