@@ -56,6 +56,11 @@ pub struct Interaction {
     pub app_permissions: Option<Permissions>,
     /// ID of the associated application.
     pub application_id: Id<ApplicationMarker>,
+    /// Maximum file size in bytes the user may upload in this interaction.
+    ///
+    /// Computed by Discord per-interaction as the maximum of the user's
+    /// upload cap (e.g. Nitro) and the guild's boost-tier cap.
+    pub attachment_size_limit: u64,
     /// Mapping of installation contexts that the interaction was
     /// authorized for to related user or guild IDs.
     pub authorizing_integration_owners:
@@ -136,13 +141,6 @@ pub struct Interaction {
     /// Present when the interaction is invoked in a direct message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<User>,
-    /// Attachment size limit in bytes for this interaction.
-    ///
-    /// Sent by Discord on the interaction payload. Authoritative per-interaction
-    /// upload cap, accounting for guild boost tier and any server overrides.
-    /// Defaults to `0` if Discord does not include the field (e.g. PING
-    /// interactions, non-guild contexts).
-    pub attachment_size_limit: u64,
 }
 
 impl Interaction {
@@ -421,6 +419,8 @@ impl<'de> Visitor<'de> for InteractionVisitor {
 
         let application_id =
             application_id.ok_or_else(|| DeError::missing_field("application_id"))?;
+        let attachment_size_limit = attachment_size_limit
+            .ok_or_else(|| DeError::missing_field("attachment_size_limit"))?;
         let authorizing_integration_owners = authorizing_integration_owners
             .ok_or_else(|| DeError::missing_field("authorizing_integration_owners"))?;
         let id = id.ok_or_else(|| DeError::missing_field("id"))?;
@@ -468,6 +468,7 @@ impl<'de> Visitor<'de> for InteractionVisitor {
         Ok(Self::Value {
             app_permissions,
             application_id,
+            attachment_size_limit,
             authorizing_integration_owners,
             channel,
             channel_id,
@@ -484,7 +485,6 @@ impl<'de> Visitor<'de> for InteractionVisitor {
             message,
             token,
             user,
-            attachment_size_limit: attachment_size_limit.unwrap_or(0),
         })
     }
 }
@@ -608,6 +608,7 @@ mod tests {
         let value = Interaction {
             app_permissions: Some(Permissions::SEND_MESSAGES),
             application_id: Id::new(100),
+            attachment_size_limit: 8_388_608,
             authorizing_integration_owners: ApplicationIntegrationMap {
                 guild: None,
                 user: None,
@@ -766,7 +767,6 @@ mod tests {
             message: None,
             token: "interaction token".into(),
             user: None,
-            attachment_size_limit: 8_388_608,
         };
 
         // TODO: switch the `assert_tokens` see #2190
@@ -783,6 +783,8 @@ mod tests {
                 Token::Str("application_id"),
                 Token::NewtypeStruct { name: "Id" },
                 Token::Str("100"),
+                Token::Str("attachment_size_limit"),
+                Token::U64(8_388_608),
                 Token::Str("authorizing_integration_owners"),
                 Token::Struct {
                     name: "ApplicationIntegrationMap",
@@ -999,8 +1001,6 @@ mod tests {
                 Token::StructEnd,
                 Token::Str("token"),
                 Token::Str("interaction token"),
-                Token::Str("attachment_size_limit"),
-                Token::U64(8_388_608),
                 Token::StructEnd,
             ],
         );
