@@ -17,6 +17,7 @@ pub struct ClientBuilder {
     pub(crate) proxy: Option<Box<str>>,
     ratelimiter: Option<RatelimiterConfiguration>,
     remember_invalid_token: bool,
+    retry_rate_limited: bool,
     pub(crate) default_headers: Option<HeaderMap>,
     pub(crate) timeout: Duration,
     pub(super) token: Option<Token>,
@@ -65,6 +66,7 @@ impl ClientBuilder {
             default_headers: self.default_headers,
             proxy: self.proxy,
             ratelimiter,
+            retry_rate_limited: self.retry_rate_limited,
             timeout: self.timeout,
             token_invalidated,
             token: self.token,
@@ -151,6 +153,27 @@ impl ClientBuilder {
         self
     }
 
+    /// Whether to retry requests that receive a 429 Too Many Requests
+    /// response.
+    ///
+    /// If enabled, the request is retried after the rate limiter grants a new
+    /// permit, or immediately if no rate limiter is configured. If disabled,
+    /// the request fails with an [`ErrorType::Response`] error whose
+    /// [`ApiError`] is [`ApiError::Ratelimited`], so the caller can decide
+    /// when to retry. The rate limiter still learns from the response's
+    /// headers either way.
+    ///
+    /// Defaults to true.
+    ///
+    /// [`ApiError`]: crate::api_error::ApiError
+    /// [`ApiError::Ratelimited`]: crate::api_error::ApiError::Ratelimited
+    /// [`ErrorType::Response`]: crate::error::ErrorType::Response
+    pub const fn retry_rate_limited(mut self, retry: bool) -> Self {
+        self.retry_rate_limited = retry;
+
+        self
+    }
+
     /// Set the token to use for HTTP requests.
     pub fn token(mut self, mut token: String) -> Self {
         let is_bot = token.starts_with("Bot ");
@@ -176,6 +199,7 @@ impl Default for ClientBuilder {
             proxy: None,
             ratelimiter: (!cfg!(test)).then_some(RatelimiterConfiguration::Undefined),
             remember_invalid_token: true,
+            retry_rate_limited: true,
             timeout: Duration::from_secs(10),
             token: None,
             use_http: false,

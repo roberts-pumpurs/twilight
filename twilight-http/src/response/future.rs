@@ -167,7 +167,9 @@ impl TimedResponseFutureGenerator {
 /// Requests that exceed a rate limit are automatically and immediately retried
 /// until they succeed or fail with another error. If configured without a
 /// [`RateLimiter`], care must be taken that an external service intercepts and
-/// delays these retry requests.
+/// delays these retry requests. Disable retrying via
+/// [`ClientBuilder::retry_rate_limited`] to instead return these responses as
+/// [`ErrorType::Response`] errors.
 ///
 /// # Canceling a response future pre-flight
 ///
@@ -193,6 +195,7 @@ impl TimedResponseFutureGenerator {
 ///
 /// Returns an [`ErrorType::Response`] error type if the request failed.
 ///
+/// [`ClientBuilder::retry_rate_limited`]: crate::client::ClientBuilder::retry_rate_limited
 /// [`ClientBuilder::timeout`]: crate::client::ClientBuilder::timeout
 /// [`ErrorType::Json`]: crate::error::ErrorType::Json
 /// [`ErrorType::Parsing`]: crate::error::ErrorType::Parsing
@@ -205,6 +208,7 @@ impl TimedResponseFutureGenerator {
 pub struct ResponseFuture<T>(Result<Inner<T>, Ready<Error>>);
 
 impl<T> ResponseFuture<T> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client: HyperClient<Connector, Full<Bytes>>,
         invalid_token: Option<Arc<AtomicBool>>,
@@ -212,6 +216,7 @@ impl<T> ResponseFuture<T> {
         span: tracing::Span,
         timeout: Duration,
         rate_limiter: Option<RateLimiter>,
+        retry_rate_limited: bool,
         endpoint: Endpoint,
     ) -> Self {
         let entered = span.entered();
@@ -238,6 +243,7 @@ impl<T> ResponseFuture<T> {
             phantom: PhantomData,
             pre_flight_check: None,
             response_generator,
+            retry_rate_limited,
             span: entered.exit(),
             stage,
         }))
@@ -406,7 +412,9 @@ impl<T: Unpin> Future for ResponseFuture<T> {
                         response.headers_mut().remove(header::CONTENT_LENGTH);
 
                         return Poll::Ready(Ok(Response::new(response)));
-                    } else if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    } else if response.status() == StatusCode::TOO_MANY_REQUESTS
+                        && inner.retry_rate_limited
+                    {
                         tracing::info!("rate limited; retrying");
                         inner.stage = match &inner.permit_generator {
                             Some(generator) => {
@@ -440,6 +448,8 @@ struct Inner<T> {
     pre_flight_check: Option<Box<dyn Fn() -> bool + Send + 'static>>,
     /// [`Timeout<HyperResponseFuture>`] generator.
     response_generator: TimedResponseFutureGenerator,
+    /// Whether to retry requests that receive a 429 response.
+    retry_rate_limited: bool,
     /// This future's span.
     span: tracing::Span,
     /// This future's current stage.
@@ -449,7 +459,16 @@ struct Inner<T> {
 #[cfg(test)]
 mod tests {
     use super::parse_ratelimit_headers;
+    use crate::{
+        Client,
+        api_error::{ApiError, RatelimitedApiError},
+        error::ErrorType,
+    };
     use http::{HeaderMap, HeaderValue, header::RETRY_AFTER};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use twilight_http_ratelimiting::RateLimitHeaders;
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
@@ -523,5 +542,42 @@ mod tests {
         map.insert(RateLimitHeaders::SCOPE, HeaderValue::from_static("global"));
 
         assert!(parse_ratelimit_headers(&map).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rate_limited_without_retry() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\n\
+            content-type: application/json\r\n\
+            content-length: 72\r\n\
+            retry-after: 1\r\n\
+            x-ratelimit-scope: user\r\n\r\n\
+            {\"global\":false,\"message\":\"You are being rate limited.\",\"retry_after\":1}";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream.write_all(RESPONSE).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let client = Client::builder()
+            .proxy(addr.to_string(), true)
+            .retry_rate_limited(false)
+            .token("Bot foo".to_owned())
+            .build();
+        let error = client.current_user().await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error.kind(),
+            ErrorType::Response {
+                error: ApiError::Ratelimited(RatelimitedApiError { retry_after, .. }),
+                status,
+                ..
+            } if (retry_after - 1.0).abs() < f64::EPSILON && status.get() == 429,
+        ));
     }
 }
