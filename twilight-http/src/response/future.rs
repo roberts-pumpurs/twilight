@@ -24,6 +24,10 @@ use twilight_http_ratelimiting::{Endpoint, Permit, PermitFuture, RateLimitHeader
 
 /// Parse ratelimit headers from a map of headers.
 ///
+/// Discord only sends the scope header on 429 responses, so bucket headers
+/// without a scope are parsed like a user scoped rate limit. Returns `None`
+/// if the response has no bucket headers or is globally rate limited.
+///
 /// # Errors
 ///
 /// Errors if a required header is missing or if a header value is of an
@@ -54,37 +58,49 @@ fn parse_ratelimit_headers(
 
             Ok(Some(RateLimitHeaders::shared(bucket, retry_after)))
         }
-        Some(b"user") => {
-            let bucket = headers
-                .get(RateLimitHeaders::BUCKET)
-                .ok_or("missing bucket header")?
-                .as_bytes()
-                .to_vec();
-            let limit = headers
-                .get(RateLimitHeaders::LIMIT)
-                .ok_or("missing limit header")?
-                .to_str()?
-                .parse()?;
-            let remaining = headers
-                .get(RateLimitHeaders::REMAINING)
-                .ok_or("missing remaining header")?
-                .to_str()?
-                .parse()?;
-            let reset_after = headers
-                .get(RateLimitHeaders::RESET_AFTER)
-                .ok_or("missing reset-after header")?
-                .to_str()?
-                .parse()?;
-
-            Ok(Some(RateLimitHeaders {
-                bucket,
-                limit,
-                remaining,
-                reset_at: Instant::now() + Duration::from_secs_f32(reset_after),
-            }))
+        Some(b"user") => parse_bucket_headers(headers).map(Some),
+        None if headers.contains_key(RateLimitHeaders::BUCKET) => {
+            parse_bucket_headers(headers).map(Some)
         }
         _ => Ok(None),
     }
+}
+
+/// Parse the bucket, limit, remaining, and reset-after headers.
+///
+/// # Errors
+///
+/// Errors if a header is missing or if a header value is of an invalid type.
+fn parse_bucket_headers(
+    headers: &HeaderMap,
+) -> Result<RateLimitHeaders, Box<dyn std::error::Error>> {
+    let bucket = headers
+        .get(RateLimitHeaders::BUCKET)
+        .ok_or("missing bucket header")?
+        .as_bytes()
+        .to_vec();
+    let limit = headers
+        .get(RateLimitHeaders::LIMIT)
+        .ok_or("missing limit header")?
+        .to_str()?
+        .parse()?;
+    let remaining = headers
+        .get(RateLimitHeaders::REMAINING)
+        .ok_or("missing remaining header")?
+        .to_str()?
+        .parse()?;
+    let reset_after = headers
+        .get(RateLimitHeaders::RESET_AFTER)
+        .ok_or("missing reset-after header")?
+        .to_str()?
+        .parse()?;
+
+    Ok(RateLimitHeaders {
+        bucket,
+        limit,
+        remaining,
+        reset_at: Instant::now() + Duration::from_secs_f32(reset_after),
+    })
 }
 
 /// Sub-futures of [`ResponseFuture`].
@@ -428,4 +444,84 @@ struct Inner<T> {
     span: tracing::Span,
     /// This future's current stage.
     stage: ResponseStageFuture,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ratelimit_headers;
+    use http::{HeaderMap, HeaderValue, header::RETRY_AFTER};
+    use twilight_http_ratelimiting::RateLimitHeaders;
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        pairs
+            .iter()
+            .map(|&(name, value)| (name.parse().unwrap(), HeaderValue::from_static(value)))
+            .collect()
+    }
+
+    const BUCKET_HEADERS: [(&str, &str); 4] = [
+        (RateLimitHeaders::BUCKET, "abcd1234"),
+        (RateLimitHeaders::LIMIT, "5"),
+        (RateLimitHeaders::REMAINING, "4"),
+        (RateLimitHeaders::RESET_AFTER, "1.5"),
+    ];
+
+    #[test]
+    fn bucket_headers_without_scope() {
+        let parsed = parse_ratelimit_headers(&headers(&BUCKET_HEADERS))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(parsed.bucket, b"abcd1234");
+        assert_eq!(parsed.limit, 5);
+        assert_eq!(parsed.remaining, 4);
+    }
+
+    #[test]
+    fn no_headers() {
+        assert!(
+            parse_ratelimit_headers(&HeaderMap::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn user_scope() {
+        let mut map = headers(&BUCKET_HEADERS);
+        map.insert(RateLimitHeaders::SCOPE, HeaderValue::from_static("user"));
+        let parsed = parse_ratelimit_headers(&map).unwrap().unwrap();
+
+        assert_eq!(parsed.bucket, b"abcd1234");
+        assert_eq!(parsed.remaining, 4);
+    }
+
+    #[test]
+    fn user_scope_missing_bucket_headers() {
+        let map = headers(&[(RateLimitHeaders::SCOPE, "user")]);
+
+        assert!(parse_ratelimit_headers(&map).is_err());
+    }
+
+    #[test]
+    fn shared_scope() {
+        let map = headers(&[
+            (RateLimitHeaders::SCOPE, "shared"),
+            (RateLimitHeaders::BUCKET, "abcd1234"),
+            (RETRY_AFTER.as_str(), "3"),
+        ]);
+        let parsed = parse_ratelimit_headers(&map).unwrap().unwrap();
+
+        assert_eq!(parsed.bucket, b"abcd1234");
+        assert_eq!(parsed.limit, 0);
+        assert_eq!(parsed.remaining, 0);
+    }
+
+    #[test]
+    fn global_scope() {
+        let mut map = headers(&BUCKET_HEADERS);
+        map.insert(RateLimitHeaders::SCOPE, HeaderValue::from_static("global"));
+
+        assert!(parse_ratelimit_headers(&map).unwrap().is_none());
+    }
 }
