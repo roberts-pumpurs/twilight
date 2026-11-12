@@ -1,6 +1,6 @@
 use super::{BytesFuture, Response};
 use crate::{
-    api_error::ApiError,
+    api_error::{ApiError, RatelimitedApiError},
     client::connector::Connector,
     error::{Error, ErrorType},
 };
@@ -101,6 +101,21 @@ fn parse_bucket_headers(
         remaining,
         reset_at: Instant::now() + Duration::from_secs_f32(reset_after),
     })
+}
+
+/// Parse the error body of a response with the given status.
+///
+/// A 429 body may also carry an error code, which the untagged [`ApiError`]
+/// would parse as [`ApiError::General`], so it is parsed as
+/// [`RatelimitedApiError`] first.
+fn parse_api_error(status: StatusCode, body: &[u8]) -> Result<ApiError, crate::json::JsonError> {
+    if status == StatusCode::TOO_MANY_REQUESTS
+        && let Ok(error) = crate::json::from_bytes::<RatelimitedApiError>(body)
+    {
+        return Ok(ApiError::Ratelimited(error));
+    }
+
+    crate::json::from_bytes(body)
 }
 
 /// Sub-futures of [`ResponseFuture`].
@@ -343,7 +358,7 @@ impl<T: Unpin> Future for ResponseFuture<T> {
                         source: Some(Box::new(source)),
                     })?;
 
-                    return Poll::Ready(Err(match crate::json::from_bytes::<ApiError>(&body) {
+                    return Poll::Ready(Err(match parse_api_error(*status, &body) {
                         Ok(error) => Error {
                             kind: ErrorType::Response {
                                 body,
@@ -544,14 +559,16 @@ mod tests {
         assert!(parse_ratelimit_headers(&map).unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn rate_limited_without_retry() {
-        const RESPONSE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\n\
+    /// Sends one request to a server that answers 429 with `body`.
+    async fn rate_limited_without_retry(body: &'static str) -> crate::Error {
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\n\
             content-type: application/json\r\n\
-            content-length: 72\r\n\
+            content-length: {}\r\n\
             retry-after: 1\r\n\
-            x-ratelimit-scope: user\r\n\r\n\
-            {\"global\":false,\"message\":\"You are being rate limited.\",\"retry_after\":1}";
+            x-ratelimit-scope: user\r\n\r\n{body}",
+            body.len(),
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -559,7 +576,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = [0; 1024];
             let _ = stream.read(&mut buf).await.unwrap();
-            stream.write_all(RESPONSE).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
             stream.shutdown().await.unwrap();
         });
 
@@ -571,6 +588,10 @@ mod tests {
         let error = client.current_user().await.unwrap_err();
         server.await.unwrap();
 
+        error
+    }
+
+    fn assert_rate_limited(error: &crate::Error) {
         assert!(matches!(
             error.kind(),
             ErrorType::Response {
@@ -579,5 +600,25 @@ mod tests {
                 ..
             } if (retry_after - 1.0).abs() < f64::EPSILON && status.get() == 429,
         ));
+    }
+
+    #[tokio::test]
+    async fn rate_limited() {
+        let error = rate_limited_without_retry(
+            r#"{"global":false,"message":"You are being rate limited.","retry_after":1}"#,
+        )
+        .await;
+
+        assert_rate_limited(&error);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_with_code() {
+        let error = rate_limited_without_retry(
+            r#"{"code":20028,"global":false,"message":"The write action you are performing on the channel has hit the write rate limit.","retry_after":1}"#,
+        )
+        .await;
+
+        assert_rate_limited(&error);
     }
 }
