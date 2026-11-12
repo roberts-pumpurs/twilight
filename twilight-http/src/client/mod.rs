@@ -253,6 +253,10 @@ pub struct Client {
     http: HyperClient<Connector, Full<Bytes>>,
     proxy: Option<Box<str>>,
     ratelimiter: Option<RateLimiter>,
+    /// Whether to retry requests that receive a 429 response.
+    ///
+    /// Configured via [`ClientBuilder::retry_rate_limited`].
+    retry_rate_limited: bool,
     timeout: Duration,
     /// Whether the token is invalidated.
     ///
@@ -3085,6 +3089,7 @@ impl Client {
             tracing::info_span!("request", method = method.name(), path),
             self.timeout,
             self.ratelimiter.clone(),
+            self.retry_rate_limited,
             Endpoint { method, path },
         );
 
