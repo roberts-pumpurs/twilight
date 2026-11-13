@@ -1,6 +1,6 @@
 use super::{BytesFuture, Response};
 use crate::{
-    api_error::{ApiError, RatelimitedApiError},
+    api_error::{ApiError, RatelimitScope, RatelimitedApiError},
     client::connector::Connector,
     error::{Error, ErrorType},
 };
@@ -107,11 +107,16 @@ fn parse_bucket_headers(
 ///
 /// A 429 body may also carry an error code, which the untagged [`ApiError`]
 /// would parse as [`ApiError::General`], so it is parsed as
-/// [`RatelimitedApiError`] first.
-fn parse_api_error(status: StatusCode, body: &[u8]) -> Result<ApiError, crate::json::JsonError> {
+/// [`RatelimitedApiError`] first. `scope` comes from the response headers.
+fn parse_api_error(
+    status: StatusCode,
+    scope: Option<RatelimitScope>,
+    body: &[u8],
+) -> Result<ApiError, crate::json::JsonError> {
     if status == StatusCode::TOO_MANY_REQUESTS
-        && let Ok(error) = crate::json::from_bytes::<RatelimitedApiError>(body)
+        && let Ok(mut error) = crate::json::from_bytes::<RatelimitedApiError>(body)
     {
+        error.scope = scope;
         return Ok(ApiError::Ratelimited(error));
     }
 
@@ -126,6 +131,8 @@ enum ResponseStageFuture {
         fut: BytesFuture,
         /// Erroneous response status code.
         status: StatusCode,
+        /// Rate limit scope from the response headers.
+        scope: Option<RatelimitScope>,
     },
     /// Future that completes when a rate limit permit is ready.
     RateLimitPermit(PermitFuture),
@@ -352,13 +359,13 @@ impl<T: Unpin> Future for ResponseFuture<T> {
 
         loop {
             match &mut inner.stage {
-                ResponseStageFuture::Error { fut, status } => {
+                ResponseStageFuture::Error { fut, status, scope } => {
                     let body = ready!(Pin::new(fut).poll(cx)).map_err(|source| Error {
                         kind: ErrorType::RequestError,
                         source: Some(Box::new(source)),
                     })?;
 
-                    return Poll::Ready(Err(match parse_api_error(*status, &body) {
+                    return Poll::Ready(Err(match parse_api_error(*status, *scope, &body) {
                         Ok(error) => Error {
                             kind: ErrorType::Response {
                                 body,
@@ -443,6 +450,10 @@ impl<T: Unpin> Future for ResponseFuture<T> {
                     } else {
                         inner.stage = ResponseStageFuture::Error {
                             status: response.status(),
+                            scope: response
+                                .headers()
+                                .get(RateLimitHeaders::SCOPE)
+                                .and_then(|value| RatelimitScope::from_header(value.as_bytes())),
                             fut: Response::<()>::new(response).bytes(),
                         };
                     }
@@ -476,7 +487,7 @@ mod tests {
     use super::parse_ratelimit_headers;
     use crate::{
         Client,
-        api_error::{ApiError, RatelimitedApiError},
+        api_error::{ApiError, RatelimitScope, RatelimitedApiError},
         error::ErrorType,
     };
     use http::{HeaderMap, HeaderValue, header::RETRY_AFTER};
@@ -559,14 +570,14 @@ mod tests {
         assert!(parse_ratelimit_headers(&map).unwrap().is_none());
     }
 
-    /// Sends one request to a server that answers 429 with `body`.
-    async fn rate_limited_without_retry(body: &'static str) -> crate::Error {
+    /// Sends one request to a server that answers 429 with `scope` and `body`.
+    async fn rate_limited_without_retry(scope: &'static str, body: &'static str) -> crate::Error {
         let response = format!(
             "HTTP/1.1 429 Too Many Requests\r\n\
             content-type: application/json\r\n\
             content-length: {}\r\n\
             retry-after: 1\r\n\
-            x-ratelimit-scope: user\r\n\r\n{body}",
+            x-ratelimit-scope: {scope}\r\n\r\n{body}",
             body.len(),
         );
 
@@ -591,34 +602,49 @@ mod tests {
         error
     }
 
-    fn assert_rate_limited(error: &crate::Error) {
+    fn assert_rate_limited(error: &crate::Error, expected: Option<RatelimitScope>) {
         assert!(matches!(
             error.kind(),
             ErrorType::Response {
-                error: ApiError::Ratelimited(RatelimitedApiError { retry_after, .. }),
+                error: ApiError::Ratelimited(RatelimitedApiError { retry_after, scope, .. }),
                 status,
                 ..
-            } if (retry_after - 1.0).abs() < f64::EPSILON && status.get() == 429,
+            } if (retry_after - 1.0).abs() < f64::EPSILON
+                && status.get() == 429
+                && *scope == expected,
         ));
     }
 
     #[tokio::test]
     async fn rate_limited() {
         let error = rate_limited_without_retry(
+            "user",
             r#"{"global":false,"message":"You are being rate limited.","retry_after":1}"#,
         )
         .await;
 
-        assert_rate_limited(&error);
+        assert_rate_limited(&error, Some(RatelimitScope::User));
     }
 
     #[tokio::test]
     async fn rate_limited_with_code() {
         let error = rate_limited_without_retry(
+            "shared",
             r#"{"code":20028,"global":false,"message":"The write action you are performing on the channel has hit the write rate limit.","retry_after":1}"#,
         )
         .await;
 
-        assert_rate_limited(&error);
+        assert_rate_limited(&error, Some(RatelimitScope::Shared));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_with_unknown_scope() {
+        let error = rate_limited_without_retry(
+            "new-scope",
+            r#"{"global":false,"message":"You are being rate limited.","retry_after":1}"#,
+        )
+        .await;
+
+        assert_rate_limited(&error, None);
     }
 }

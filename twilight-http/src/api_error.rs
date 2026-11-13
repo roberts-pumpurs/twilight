@@ -103,6 +103,46 @@ pub struct RatelimitedApiError {
     pub message: String,
     /// Amount of time to wait before retrying.
     pub retry_after: f64,
+    /// Scope from the response's `X-RateLimit-Scope` header, if present.
+    ///
+    /// Discord does not count a [`RatelimitScope::Shared`] 429 toward its
+    /// invalid request limit.
+    #[serde(skip)]
+    pub scope: Option<RatelimitScope>,
+}
+
+/// Scope of a rate limit, from the `X-RateLimit-Scope` header of a 429.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum RatelimitScope {
+    /// Per bot or user limit, global or per route.
+    User,
+    /// Global limit for all of the bot's requests.
+    Global,
+    /// Per resource limit shared by every user of the resource.
+    Shared,
+}
+
+impl RatelimitScope {
+    /// Parse an `X-RateLimit-Scope` header value. Returns `None` for an
+    /// unknown scope.
+    pub const fn from_header(value: &[u8]) -> Option<Self> {
+        match value {
+            b"user" => Some(Self::User),
+            b"global" => Some(Self::Global),
+            b"shared" => Some(Self::Shared),
+            _ => None,
+        }
+    }
+
+    /// Name of the scope, as Discord sends it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Global => "global",
+            Self::Shared => "shared",
+        }
+    }
 }
 
 impl Display for RatelimitedApiError {
@@ -200,6 +240,7 @@ mod tests {
             global: true,
             message: "You are being rate limited.".to_owned(),
             retry_after: 6.457,
+            scope: None,
         };
 
         serde_test::assert_tokens(
@@ -233,6 +274,7 @@ mod tests {
             global: false,
             message: "You are being rate limited.".to_owned(),
             retry_after: 0.362,
+            scope: None,
         });
 
         serde_test::assert_tokens(
