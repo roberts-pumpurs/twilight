@@ -912,11 +912,12 @@ pub fn button(button: &Button) -> Result<(), ComponentValidationError> {
 
     // Then, we check if the button is a link and a URL is not set.
     //
-    // Lastly, we check if the button is not a link and a custom ID is
-    // not set.
+    // Lastly, we check if the button is neither a link nor a premium button
+    // and a custom ID is not set. A premium button never has a custom ID; the
+    // check above already requires its SKU ID.
     let is_link = button.style == ButtonStyle::Link;
 
-    if (is_link && !has_url) || (!is_link && !has_custom_id) {
+    if (is_link && !has_url) || (!is_link && !is_premium && !has_custom_id) {
         return Err(ComponentValidationError {
             kind: ComponentValidationErrorType::ButtonStyle {
                 style: button.style,
@@ -1662,6 +1663,34 @@ mod tests {
                 if error_style == *style
             ));
         }
+    }
+
+    // Test that a premium button with only a SKU ID is valid, and that a
+    // label on it is rejected.
+    #[test]
+    fn button_premium() {
+        let mut button = Button {
+            custom_id: None,
+            disabled: false,
+            emoji: None,
+            label: None,
+            style: ButtonStyle::Premium,
+            url: None,
+            sku_id: Some(twilight_model::id::Id::new(1)),
+            id: None,
+        };
+
+        assert!(super::button(&button).is_ok());
+
+        button.label = Some("Buy".to_owned());
+        assert!(matches!(
+            super::button(&button),
+            Err(ComponentValidationError {
+                kind: ComponentValidationErrorType::ButtonStyle {
+                    style: ButtonStyle::Premium,
+                }
+            })
+        ));
     }
 
     #[test]
